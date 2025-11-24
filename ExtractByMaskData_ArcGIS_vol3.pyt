@@ -2,19 +2,21 @@
 """
 ExtractByMaskData_Version6.pyt
 
-Tool: Extract By Mask to GeoTIFF (Annotated, Auto Scale Bar, WGS84)
+Tool: Extract By Mask to GeoTIFF (Annotated, Fixed Scale Bar, WGS84)
 
 - Clips an input raster by polygon mask (like Extract By Mask).
 - Projects the clipped raster to WGS 84 (EPSG:4326).
 - Saves to GeoTIFF (.tif).
 - Burns into the image pixels:
     * North arrow (bottom-right, on white background)
-    * Scale bar in meters (automatic "nice" length based on pixel size)
+    * Scale bar in meters (fixed 100 m length)
     * Text block in the bottom-right with 3 stacked lines:
           <DATETIME>
           Lat: <lat>
-          Lon: <lon>
+          Long: <lon>
       where lat/lon are the center of the (projected) raster in WGS-84.
+
+Works with both SAR and EO raster inputs (any raster supported by ArcPy).
 
 Requires (ArcGIS Pro environment):
     - arcpy
@@ -53,8 +55,8 @@ class ExtractByMaskToGeoTIFF_Annotated(object):
         self.label = "Extract By Mask to GeoTIFF (Annotated, WGS84)"
         self.description = (
             "Clip a raster by polygon mask, project output to WGS 84, save as "
-            "GeoTIFF, and burn in a north arrow, automatic scale bar in meters, "
-            "and a bottom-right text block with datetime + center lat/lon."
+            "GeoTIFF, and burn in a north arrow, fixed 100 m scale bar, and a "
+            "bottom-right text block with datetime + center lat/long."
         )
         self.canRunInBackground = True
 
@@ -98,17 +100,7 @@ class ExtractByMaskToGeoTIFF_Annotated(object):
         )
         p3.value = ""
 
-        # 4 – (Optional) Preferred scale-bar length in meters.
-        p4 = arcpy.Parameter(
-            displayName="Preferred Scale Bar Length (m) (optional – auto if empty)",
-            name="scale_bar_m",
-            datatype="GPLong",
-            parameterType="Optional",
-            direction="Input"
-        )
-        p4.value = None
-
-        return [p0, p1, p2, p3, p4]
+        return [p0, p1, p2, p3]
 
     def isLicensed(self):
         return True
@@ -127,19 +119,12 @@ class ExtractByMaskToGeoTIFF_Annotated(object):
         in_mask = parameters[1].valueAsText
         out_tif = parameters[2].valueAsText
         datetime_text = parameters[3].valueAsText or ""
-        preferred_scale_m = parameters[4].value
-
-        if preferred_scale_m in (None, "", 0):
-            preferred_scale_m = None
-        else:
-            preferred_scale_m = int(preferred_scale_m)
 
         _run_extract_by_mask_annotated(
             in_raster,
             in_mask,
             out_tif,
             datetime_text=datetime_text,
-            preferred_scale_m=preferred_scale_m,
             messages=messages
         )
         return
@@ -153,7 +138,6 @@ def _run_extract_by_mask_annotated(
     in_mask,
     out_tif,
     datetime_text="",
-    preferred_scale_m=None,
     messages=None
 ):
     if messages is None:
@@ -203,7 +187,6 @@ def _run_extract_by_mask_annotated(
         center_lat=lat,
         center_lon=lon,
         pixel_size_m=pixel_size_m,
-        preferred_scale_m=preferred_scale_m,
         messages=messages
     )
 
@@ -328,7 +311,6 @@ def _annotate_geotiff(
     center_lat,
     center_lon,
     pixel_size_m,
-    preferred_scale_m,
     messages
 ):
     # Open image
@@ -342,7 +324,7 @@ def _annotate_geotiff(
 
     # Margins for canvas around raster
     margin_top = 0
-    margin_bottom = 90
+    margin_bottom = 120
     margin_left = 0
     margin_right = 0
 
@@ -359,10 +341,10 @@ def _annotate_geotiff(
     font_small, font_medium = _get_fonts()
 
     # ------------------------------------------------------------------
-    # 1) Scale bar (auto meters) – bottom-left
+    # 1) Scale bar (fixed 100 m) – bottom-left
     # ------------------------------------------------------------------
     if pixel_size_m:
-        scale_len_m = _choose_scale_length(pixel_size_m, w, preferred_scale_m)
+        scale_len_m = 100.0
         scale_px = scale_len_m / pixel_size_m
 
         bar_margin = 20
@@ -420,12 +402,14 @@ def _annotate_geotiff(
     lines = []
 
     dt_text = datetime_text.strip()
-    if not dt_text:
-        dt_text = "Date/Time: N/A"
+    if dt_text:
+        dt_text = f"Date/Time: {dt_text}"
+    else:
+        dt_text = "Date/Time: __________"
     lines.append(dt_text)
 
     lines.append("Lat: {:.5f}".format(center_lat))
-    lines.append("Lon: {:.5f}".format(center_lon))
+    lines.append("Long: {:.5f}".format(center_lon))
 
     # Measure text
     max_text_w = 0
@@ -503,44 +487,3 @@ def _get_fonts():
         medium = ImageFont.load_default()
 
     return small, medium
-
-
-def _choose_scale_length(pixel_size_m, image_width_px, preferred_scale_m):
-    """
-    Choose a "nice" scale-bar length in meters.
-
-    The goal is to have the bar somewhere between ~80 and ~250 pixels
-    on the final image. User's preferred value is honoured if reasonable,
-    otherwise a default from a nice sequence is used.
-    """
-    min_px = 80.0
-    max_px = 250.0
-
-    if preferred_scale_m:
-        px = preferred_scale_m / pixel_size_m
-        if min_px <= px <= max_px:
-            return float(preferred_scale_m)
-
-    # If preferred value is missing or not suitable, pick from nice candidates
-    candidates = [
-        10, 20, 50,
-        100, 200, 500,
-        1000, 2000, 5000,
-        10000, 20000, 50000
-    ]
-
-    best = candidates[0]
-    best_px = best / pixel_size_m
-    for c in candidates:
-        px = c / pixel_size_m
-        if min_px <= px <= max_px:
-            best = c
-            best_px = px
-            break
-        # Otherwise keep the one whose pixel length is closest to mid-range
-        mid_target = (min_px + max_px) / 2.0
-        if abs(px - mid_target) < abs(best_px - mid_target):
-            best = c
-            best_px = px
-
-    return float(best)
