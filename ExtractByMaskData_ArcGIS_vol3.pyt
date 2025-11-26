@@ -23,6 +23,9 @@ Requires (ArcGIS Pro environment):
 """
 
 import math
+import os
+import tempfile
+import numpy as np
 import arcpy
 from arcpy.sa import ExtractByMask
 
@@ -186,7 +189,11 @@ def _run_extract_by_mask_annotated(
     temp_tif = out_tif
     messages.addMessage(f"Projected raster saved to: {temp_tif}")
 
+    georef_info = _capture_georeference(temp_tif, messages)
+
     # 3) Center point lat/lon in WGS-84 (now the native CRS)
+    # Mask controls the chip extent, but we still derive the center from the
+    # projected raster so the annotation reflects the exact output footprint.
     lat, lon = _get_center_latlon(temp_tif, messages)
     messages.addMessage(f"Center lat/lon (WGS-84): {lat:.6f}, {lon:.6f}")
 
@@ -204,6 +211,7 @@ def _run_extract_by_mask_annotated(
         center_lon=lon,
         pixel_size_m=pixel_size_m,
         preferred_scale_m=preferred_scale_m,
+        georef_info=georef_info,
         messages=messages
     )
 
@@ -249,6 +257,74 @@ def _get_center_latlon(raster_path, messages):
     lat = geo.centroid.Y
     lon = geo.centroid.X
     return (lat, lon)
+
+
+def _capture_georeference(raster_path, messages):
+    """Capture basic georeferencing info before Pillow overwrites metadata."""
+    desc = arcpy.Describe(raster_path)
+    ext = desc.extent
+
+    cell_w = float(getattr(desc, "meanCellWidth", 0.0) or 0.0)
+    cell_h = float(getattr(desc, "meanCellHeight", 0.0) or 0.0)
+    if not cell_w or not cell_h:
+        # Fall back to extent/size calculation
+        cell_w = (ext.XMax - ext.XMin) / max(desc.width, 1)
+        cell_h = (ext.YMax - ext.YMin) / max(desc.height, 1)
+
+    info = {
+        "spatial_reference": desc.spatialReference,
+        "x_origin": ext.XMin,
+        "y_origin": ext.YMin,
+        "x_cellsize": cell_w,
+        "y_cellsize": cell_h
+    }
+
+    messages.addMessage(
+        "Captured georeferencing -> Origin: ({:.6f}, {:.6f}), Cellsize: ({:.6f}, {:.6f})".format(
+            info["x_origin"], info["y_origin"], info["x_cellsize"], info["y_cellsize"]
+        )
+    )
+    return info
+
+
+def _reapply_georeference(tif_path, array_data, georef_info, messages):
+    """Write annotated array back to disk and reattach georeferencing tags."""
+    lower_left = arcpy.Point(georef_info["x_origin"], georef_info["y_origin"])
+    band_count = 1 if array_data.ndim == 2 else array_data.shape[2]
+
+    temp_band_paths = []
+    try:
+        # NumPyArrayToRaster expects a 2D array; build per-band rasters
+        bands_iterable = [array_data] if band_count == 1 else [array_data[:, :, i] for i in range(band_count)]
+
+        for idx, band_arr in enumerate(bands_iterable):
+            band_raster = arcpy.NumPyArrayToRaster(
+                band_arr,
+                lower_left,
+                georef_info["x_cellsize"],
+                georef_info["y_cellsize"]
+            )
+
+            temp_band = os.path.join(tempfile.gettempdir(), f"_annot_band_{idx}.tif")
+            if arcpy.Exists(temp_band):
+                arcpy.management.Delete(temp_band)
+
+            band_raster.save(temp_band)
+            temp_band_paths.append(temp_band)
+
+        if len(temp_band_paths) == 1:
+            arcpy.management.CopyRaster(temp_band_paths[0], tif_path, pixel_type="8_BIT_UNSIGNED")
+        else:
+            arcpy.management.CompositeBands(temp_band_paths, tif_path)
+
+        arcpy.management.DefineProjection(tif_path, georef_info["spatial_reference"])
+        messages.addMessage("Reapplied georeferencing to annotated raster.")
+    except Exception as ex:
+        messages.addWarningMessage(f"Unable to reapply georeferencing: {ex}")
+    finally:
+        for path in temp_band_paths:
+            if arcpy.Exists(path):
+                arcpy.management.Delete(path)
 
 
 # ----------------------------------------------------------------------
@@ -329,6 +405,7 @@ def _annotate_geotiff(
     center_lon,
     pixel_size_m,
     preferred_scale_m,
+    georef_info,
     messages
 ):
     # Open image
@@ -340,20 +417,7 @@ def _annotate_geotiff(
 
     w, h = img.size
 
-    # Margins for canvas around raster
-    margin_top = 0
-    margin_bottom = 90
-    margin_left = 0
-    margin_right = 0
-
-    canvas_w = w + margin_left + margin_right
-    canvas_h = h + margin_top + margin_bottom
-
-    bg_color = (255, 255, 255)
-    canvas = Image.new("RGB", (canvas_w, canvas_h), bg_color)
-    canvas.paste(img, (margin_left, margin_top))
-
-    draw = ImageDraw.Draw(canvas)
+    draw = ImageDraw.Draw(img)
 
     # Slightly smaller fonts
     font_small, font_medium = _get_fonts()
@@ -365,13 +429,19 @@ def _annotate_geotiff(
         scale_len_m = _choose_scale_length(pixel_size_m, w, preferred_scale_m)
         scale_px = scale_len_m / pixel_size_m
 
-        bar_margin = 20
+        bar_margin = 16
         bar_height = 8
 
         # Bar will sit a bit above the very bottom
-        bar_y = canvas_h - margin_bottom // 2
-        bar_x_left = margin_left + bar_margin
+        bar_y = h - 20
+        bar_x_left = bar_margin
         bar_x_right = int(bar_x_left + scale_px)
+
+        # Keep bar inside the chip width
+        if bar_x_right > w - bar_margin:
+            bar_x_right = w - bar_margin
+            scale_len_m = (bar_x_right - bar_x_left) * pixel_size_m
+            scale_px = bar_x_right - bar_x_left
 
         # Background patch behind bar and label
         label_text = "{} m".format(int(scale_len_m))
@@ -444,9 +514,9 @@ def _annotate_geotiff(
     block_w = max_text_w + 2 * pad
     block_h = arrow_height + arrow_extra_space + total_text_h + 2 * pad
 
-    block_x2 = canvas_w - 10
+    block_x2 = w - 10
     block_x1 = block_x2 - block_w
-    block_y2 = canvas_h - 10
+    block_y2 = h - 10
     block_y1 = block_y2 - block_h
 
     # White background block (bottom-right)
@@ -488,8 +558,9 @@ def _annotate_geotiff(
         else:
             text_y += h_txt
 
-    # Save annotated TIFF (overwrite original tif_path)
-    canvas.save(tif_path)
+    # Save annotated TIFF (overwrite original tif_path), then restore georeference
+    annotated_array = np.array(img)
+    _reapply_georeference(tif_path, annotated_array, georef_info, messages)
 
 
 def _get_fonts():
