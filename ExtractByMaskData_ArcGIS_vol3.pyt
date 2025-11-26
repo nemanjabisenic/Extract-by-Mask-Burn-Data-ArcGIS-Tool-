@@ -275,6 +275,7 @@ def _capture_georeference(raster_path, messages):
         "spatial_reference": desc.spatialReference,
         "x_origin": ext.XMin,
         "y_origin": ext.YMin,
+        "y_max": ext.YMax,
         "x_cellsize": cell_w,
         "y_cellsize": cell_h
     }
@@ -289,7 +290,9 @@ def _capture_georeference(raster_path, messages):
 
 def _reapply_georeference(tif_path, array_data, georef_info, messages):
     """Write annotated array back to disk and reattach georeferencing tags."""
-    lower_left = arcpy.Point(georef_info["x_origin"], georef_info["y_origin"])
+    # Preserve the original northern edge by shifting the origin when rows grow.
+    new_y_origin = georef_info["y_max"] - array_data.shape[0] * georef_info["y_cellsize"]
+    lower_left = arcpy.Point(georef_info["x_origin"], new_y_origin)
     band_count = 1 if array_data.ndim == 2 else array_data.shape[2]
 
     temp_band_paths = []
@@ -442,13 +445,12 @@ def _annotate_geotiff(
 
     arrow_height = 28
     arrow_half_width = 10
-    arrow_text_gap = 6
 
     # Arrow + text block sizing
     n_w, n_h = _textsize(ImageDraw.Draw(base_img), "N", font_small)
     text_block_h = total_text_h + line_gap * (len(lines) - 1)
-    arrow_block_h = n_h + 2 + arrow_height + arrow_text_gap + text_block_h
-    arrow_block_w = max(arrow_half_width * 2 + 8, max_text_w) + band_pad_x * 2
+    arrow_only_h = n_h + 2 + arrow_height
+    text_block_w = max_text_w + band_pad_x * 2
 
     # Scale bar sizing (if applicable)
     scale_bar_block_h = 0
@@ -484,7 +486,12 @@ def _annotate_geotiff(
             "Pixel size in meters unknown – scale bar omitted."
         )
 
-    band_height = max(arrow_block_h, scale_bar_block_h) + band_pad_y * 2
+    gap_after_scale = 10
+    band_height = max(
+        text_block_h,
+        scale_bar_block_h + gap_after_scale + arrow_only_h,
+        arrow_only_h
+    ) + band_pad_y * 2
 
     # Build new canvas with white band underneath the chip
     new_img = Image.new("RGB", (w, h + band_height), (255, 255, 255))
@@ -519,24 +526,33 @@ def _annotate_geotiff(
         draw.text((label_x, label_y), scale_bar_dims["label_text"], font=font_small, fill=(0, 0, 0))
 
     # ------------------------------------------------------------------
-    # 2) Arrow and stacked text on right of the white band
+    # 2) North arrow on bottom-left of the white band
     # ------------------------------------------------------------------
-    block_x2 = w - band_pad_x
-    block_x1 = block_x2 - arrow_block_w
-    arrow_top_y = band_top + band_pad_y + n_h + 2
-    arrow_bottom_y = arrow_top_y + arrow_height
+    arrow_bottom_y = band_top + band_height - band_pad_y
+    arrow_top_y = arrow_bottom_y - arrow_height
+    n_y = arrow_top_y - n_h - 2
+    if scale_bar_dims:
+        min_n_y = band_top + band_pad_y + scale_bar_block_h + gap_after_scale
+        if n_y < min_n_y:
+            shift = min_n_y - n_y
+            arrow_bottom_y += shift
+            arrow_top_y += shift
+            n_y += shift
 
-    arrow_center_x = block_x1 + arrow_block_w / 2.0
+    arrow_center_x = band_pad_x + arrow_half_width + 6
     tip = (arrow_center_x, arrow_top_y)
     left = (arrow_center_x - arrow_half_width, arrow_bottom_y)
     right = (arrow_center_x + arrow_half_width, arrow_bottom_y)
     draw.polygon([tip, left, right], fill=(0, 0, 0))
 
     n_x = arrow_center_x - n_w / 2.0
-    n_y = arrow_top_y - n_h - 2
     draw.text((n_x, n_y), "N", font=font_small, fill=(0, 0, 0))
 
-    text_y = arrow_bottom_y + arrow_text_gap
+    # 3) Stacked text on the right of the white band
+    # ------------------------------------------------------------------
+    block_x2 = w - band_pad_x
+    block_x1 = block_x2 - text_block_w
+    text_y = band_top + band_pad_y
     for idx, line in enumerate(lines):
         t_w, t_h = _textsize(draw, line, font_small)
         text_x = block_x1 + band_pad_x
