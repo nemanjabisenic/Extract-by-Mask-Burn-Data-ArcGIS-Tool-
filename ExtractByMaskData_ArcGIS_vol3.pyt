@@ -408,158 +408,146 @@ def _annotate_geotiff(
     georef_info,
     messages
 ):
-    # Open image
-    img = Image.open(tif_path)
+    # Open image and force RGB for safe drawing
+    base_img = Image.open(tif_path)
+    if base_img.mode not in ("RGB", "RGBA"):
+        base_img = base_img.convert("RGB")
 
-    # Force RGB for safe drawing
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
-
-    w, h = img.size
-
-    draw = ImageDraw.Draw(img)
+    w, h = base_img.size
 
     # Slightly smaller fonts
     font_small, font_medium = _get_fonts()
 
-    # ------------------------------------------------------------------
-    # 1) Scale bar (auto meters) – bottom-left
-    # ------------------------------------------------------------------
+    # Prepare text lines
+    lines = []
+    dt_text = datetime_text.strip()
+    if not dt_text:
+        dt_text = "Date/Time: N/A"
+    lines.append(dt_text)
+    lines.append("Lat: {:.5f}".format(center_lat))
+    lines.append("Lon: {:.5f}".format(center_lon))
+
+    # Measurements
+    max_text_w = 0
+    total_text_h = 0
+    for line in lines:
+        t_w, t_h = _textsize(ImageDraw.Draw(base_img), line, font_small)
+        max_text_w = max(max_text_w, t_w)
+        total_text_h += t_h
+
+    # Layout constants
+    band_pad_x = 12
+    band_pad_y = 10
+    line_gap = 6  # small gap between text elements
+
+    arrow_height = 28
+    arrow_half_width = 10
+    arrow_text_gap = 6
+
+    # Arrow + text block sizing
+    n_w, n_h = _textsize(ImageDraw.Draw(base_img), "N", font_small)
+    text_block_h = total_text_h + line_gap * (len(lines) - 1)
+    arrow_block_h = n_h + 2 + arrow_height + arrow_text_gap + text_block_h
+    arrow_block_w = max(arrow_half_width * 2 + 8, max_text_w) + band_pad_x * 2
+
+    # Scale bar sizing (if applicable)
+    scale_bar_block_h = 0
+    scale_bar_dims = None
     if pixel_size_m:
         scale_len_m = _choose_scale_length(pixel_size_m, w, preferred_scale_m)
         scale_px = scale_len_m / pixel_size_m
 
-        bar_margin = 16
         bar_height = 8
+        label_text = "{} m".format(int(scale_len_m))
+        label_w, label_h = _textsize(ImageDraw.Draw(base_img), label_text, font_small)
 
-        # Bar will sit a bit above the very bottom
-        bar_y = h - 20
-        bar_x_left = bar_margin
+        bar_x_left = band_pad_x
         bar_x_right = int(bar_x_left + scale_px)
-
-        # Keep bar inside the chip width
-        if bar_x_right > w - bar_margin:
-            bar_x_right = w - bar_margin
+        if bar_x_right > w - band_pad_x:
+            bar_x_right = w - band_pad_x
             scale_len_m = (bar_x_right - bar_x_left) * pixel_size_m
             scale_px = bar_x_right - bar_x_left
+            label_text = "{} m".format(int(scale_len_m))
+            label_w, label_h = _textsize(ImageDraw.Draw(base_img), label_text, font_small)
 
-        # Background patch behind bar and label
-        label_text = "{} m".format(int(scale_len_m))
-        label_w, label_h = _textsize(draw, label_text, font_small)
-
-        pad = 6
-        # Move label block slightly further up relative to the bar
-        label_offset_up = 6
-        patch_x1 = bar_x_left - pad
-        patch_y1 = bar_y - bar_height - pad - label_offset_up
-        patch_x2 = max(bar_x_right, bar_x_left + label_w) + pad
-        patch_y2 = bar_y + bar_height + label_h + pad
-
-        draw.rectangle(
-            [patch_x1, patch_y1, patch_x2, patch_y2],
-            fill=(255, 255, 255)
-        )
-
-        # Bar
-        draw.rectangle(
-            [bar_x_left, bar_y - bar_height // 2, bar_x_right, bar_y + bar_height // 2],
-            fill=(0, 0, 0)
-        )
-
-        # Outline around bar
-        draw.rectangle(
-            [bar_x_left, bar_y - bar_height // 2, bar_x_right, bar_y + bar_height // 2],
-            outline=(0, 0, 0),
-            width=1
-        )
-
-        # Label, centered above the bar (higher than before)
-        label_x = bar_x_left + (bar_x_right - bar_x_left) / 2.0 - label_w / 2.0
-        label_y = patch_y1 + 2  # slightly closer to top of patch
-        draw.text((label_x, label_y), label_text, font=font_small, fill=(0, 0, 0))
+        scale_bar_block_h = label_h + 6 + bar_height
+        scale_bar_dims = {
+            "bar_x_left": bar_x_left,
+            "bar_x_right": bar_x_right,
+            "bar_height": bar_height,
+            "label_text": label_text,
+            "label_w": label_w,
+            "label_h": label_h
+        }
     else:
         messages.addWarningMessage(
             "Pixel size in meters unknown – scale bar omitted."
         )
 
+    band_height = max(arrow_block_h, scale_bar_block_h) + band_pad_y * 2
+
+    # Build new canvas with white band underneath the chip
+    new_img = Image.new("RGB", (w, h + band_height), (255, 255, 255))
+    new_img.paste(base_img, (0, 0))
+    draw = ImageDraw.Draw(new_img)
+
+    band_top = h
+
     # ------------------------------------------------------------------
-    # 2) Bottom-right block: North arrow + stacked text lines
+    # 1) Scale bar on left of the white band
     # ------------------------------------------------------------------
+    if scale_bar_dims:
+        bar_y = band_top + band_pad_y + scale_bar_dims["label_h"] + 4 + scale_bar_dims["bar_height"] // 2
+        patch_x1 = scale_bar_dims["bar_x_left"] - 6
+        patch_y1 = band_top + band_pad_y
+        patch_x2 = max(scale_bar_dims["bar_x_right"], scale_bar_dims["bar_x_left"] + scale_bar_dims["label_w"]) + 6
+        patch_y2 = bar_y + scale_bar_dims["bar_height"] // 2 + 6
 
-    # Prepare text lines
-    lines = []
+        draw.rectangle([patch_x1, patch_y1, patch_x2, patch_y2], fill=(255, 255, 255))
+        draw.rectangle(
+            [scale_bar_dims["bar_x_left"], bar_y - scale_bar_dims["bar_height"] // 2,
+             scale_bar_dims["bar_x_right"], bar_y + scale_bar_dims["bar_height"] // 2],
+            fill=(0, 0, 0)
+        )
+        draw.rectangle(
+            [scale_bar_dims["bar_x_left"], bar_y - scale_bar_dims["bar_height"] // 2,
+             scale_bar_dims["bar_x_right"], bar_y + scale_bar_dims["bar_height"] // 2],
+            outline=(0, 0, 0), width=1
+        )
+        label_x = scale_bar_dims["bar_x_left"] + (scale_bar_dims["bar_x_right"] - scale_bar_dims["bar_x_left"]) / 2.0 - scale_bar_dims["label_w"] / 2.0
+        label_y = band_top + band_pad_y
+        draw.text((label_x, label_y), scale_bar_dims["label_text"], font=font_small, fill=(0, 0, 0))
 
-    dt_text = datetime_text.strip()
-    if not dt_text:
-        dt_text = "Date/Time: N/A"
-    lines.append(dt_text)
-
-    lines.append("Lat: {:.5f}".format(center_lat))
-    lines.append("Lon: {:.5f}".format(center_lon))
-
-    # Measure text
-    max_text_w = 0
-    total_text_h = 0
-    line_heights = []
-    for line in lines:
-        w_txt, h_txt = _textsize(draw, line, font_small)
-        max_text_w = max(max_text_w, w_txt)
-        total_text_h += h_txt
-        line_heights.append(h_txt)
-
-    pad = 8
-    arrow_height = 24
-    arrow_extra_space = 6  # gap between arrow and first text line
-
-    block_w = max_text_w + 2 * pad
-    block_h = arrow_height + arrow_extra_space + total_text_h + 2 * pad
-
-    block_x2 = w - 10
-    block_x1 = block_x2 - block_w
-    block_y2 = h - 10
-    block_y1 = block_y2 - block_h
-
-    # White background block (bottom-right)
-    draw.rectangle(
-        [block_x1, block_y1, block_x2, block_y2],
-        fill=(255, 255, 255)
-    )
-
-    # --- North arrow within block (top, centered) ---
-    arrow_center_x = block_x1 + block_w / 2.0
-    arrow_top_y = block_y1 + pad
+    # ------------------------------------------------------------------
+    # 2) Arrow and stacked text on right of the white band
+    # ------------------------------------------------------------------
+    block_x2 = w - band_pad_x
+    block_x1 = block_x2 - arrow_block_w
+    arrow_top_y = band_top + band_pad_y + n_h + 2
     arrow_bottom_y = arrow_top_y + arrow_height
 
-    arrow_half_width = 10
+    arrow_center_x = block_x1 + arrow_block_w / 2.0
     tip = (arrow_center_x, arrow_top_y)
     left = (arrow_center_x - arrow_half_width, arrow_bottom_y)
     right = (arrow_center_x + arrow_half_width, arrow_bottom_y)
-
     draw.polygon([tip, left, right], fill=(0, 0, 0))
 
-    # Letter "N" above arrow tip
-    n_text = "N"
-    n_w, n_h = _textsize(draw, n_text, font_small)
     n_x = arrow_center_x - n_w / 2.0
     n_y = arrow_top_y - n_h - 2
-    draw.text((n_x, n_y), n_text, font=font_small, fill=(0, 0, 0))
+    draw.text((n_x, n_y), "N", font=font_small, fill=(0, 0, 0))
 
-    # --- Text lines stacked below arrow ---
-    text_y = arrow_bottom_y + arrow_extra_space
-    extra_gap_between_dt_and_coords = 4  # extra spacing after first line
-    for i, line in enumerate(lines):
-        w_txt, h_txt = _textsize(draw, line, font_small)
-        text_x = block_x1 + pad
+    text_y = arrow_bottom_y + arrow_text_gap
+    for idx, line in enumerate(lines):
+        t_w, t_h = _textsize(draw, line, font_small)
+        text_x = block_x1 + band_pad_x
         draw.text((text_x, text_y), line, font=font_small, fill=(0, 0, 0))
-
-        # Move down to next line; add extra space only between date/time and first coord line
-        if i == 0:
-            text_y += h_txt + extra_gap_between_dt_and_coords
+        if idx < len(lines) - 1:
+            text_y += t_h + line_gap
         else:
-            text_y += h_txt
+            text_y += t_h
 
     # Save annotated TIFF (overwrite original tif_path), then restore georeference
-    annotated_array = np.array(img)
+    annotated_array = np.array(new_img)
     _reapply_georeference(tif_path, annotated_array, georef_info, messages)
 
 
