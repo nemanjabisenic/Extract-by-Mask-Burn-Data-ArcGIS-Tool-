@@ -552,7 +552,7 @@ def _annotate_geotiff(
     # ------------------------------------------------------------------
     block_x2 = w - band_pad_x
     block_x1 = block_x2 - text_block_w
-    text_y = band_top + band_pad_y
+    text_y = band_top + band_height - band_pad_y - text_block_h
     for idx, line in enumerate(lines):
         t_w, t_h = _textsize(draw, line, font_small)
         text_x = block_x1 + band_pad_x
