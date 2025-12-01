@@ -266,10 +266,21 @@ def _capture_georeference(raster_path, messages):
 
     cell_w = float(getattr(desc, "meanCellWidth", 0.0) or 0.0)
     cell_h = float(getattr(desc, "meanCellHeight", 0.0) or 0.0)
+
+    cols = getattr(desc, "width", None)
+    rows = getattr(desc, "height", None)
+    if cols in (None, 0) or rows in (None, 0):
+        try:
+            cols = int(arcpy.management.GetRasterProperties(raster_path, "COLUMNCOUNT").getOutput(0))
+            rows = int(arcpy.management.GetRasterProperties(raster_path, "ROWCOUNT").getOutput(0))
+        except Exception:
+            cols = cols or 0
+            rows = rows or 0
+
     if not cell_w or not cell_h:
-        # Fall back to extent/size calculation
-        cell_w = (ext.XMax - ext.XMin) / max(desc.width, 1)
-        cell_h = (ext.YMax - ext.YMin) / max(desc.height, 1)
+        # Fall back to extent/size calculation when mean cell sizes are missing
+        cell_w = (ext.XMax - ext.XMin) / max(cols or 1, 1)
+        cell_h = (ext.YMax - ext.YMin) / max(rows or 1, 1)
 
     info = {
         "spatial_reference": desc.spatialReference,
