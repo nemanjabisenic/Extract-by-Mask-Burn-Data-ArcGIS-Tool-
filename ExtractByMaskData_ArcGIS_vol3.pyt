@@ -354,6 +354,13 @@ def _estimate_pixel_size_meters(raster_path, messages):
     sr = desc.spatialReference
     cell_w = float(getattr(desc, "meanCellWidth", 0.0) or 0.0)
 
+    cols = getattr(desc, "width", None)
+    if cols in (None, 0):
+        try:
+            cols = int(arcpy.management.GetRasterProperties(raster_path, "COLUMNCOUNT").getOutput(0))
+        except Exception:
+            cols = 0
+
     unit_name = (sr.linearUnitName or "").lower() if sr else ""
     if "metre" in unit_name or "meter" in unit_name or unit_name == "m":
         return abs(cell_w)
@@ -362,7 +369,7 @@ def _estimate_pixel_size_meters(raster_path, messages):
         ext = desc.extent
         cx = (ext.XMin + ext.XMax) / 2.0
         cy = (ext.YMin + ext.YMax) / 2.0
-        w = cell_w or (ext.XMax - ext.XMin) / max(desc.width, 1)
+        w = cell_w or (ext.XMax - ext.XMin) / max(cols or 1, 1)
 
         pt1 = arcpy.PointGeometry(arcpy.Point(cx, cy), sr)
         pt2 = arcpy.PointGeometry(arcpy.Point(cx + w, cy), sr)
