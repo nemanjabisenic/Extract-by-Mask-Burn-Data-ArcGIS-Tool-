@@ -416,6 +416,46 @@ def _textsize(draw, text, font):
         return draw.textsize(text, font=font)
 
 
+def _open_raster_as_image(raster_path, messages):
+    """Fallback to open a raster via ArcPy/NumPy when Pillow cannot read it."""
+    try:
+        arr = arcpy.RasterToNumPyArray(raster_path)
+    except Exception as ex:
+        messages.addErrorMessage(f"Failed to read raster to NumPy array: {ex}")
+        raise
+
+    if arr.ndim == 3:
+        # RasterToNumPyArray returns (bands, rows, cols) for multiband rasters
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.ndim == 2:
+        arr = arr[:, :, np.newaxis]
+
+    if arr.shape[2] > 4:
+        messages.addWarningMessage(
+            f"Raster has {arr.shape[2]} bands; only the first 3 will be used for annotation."
+        )
+        arr = arr[:, :, :3]
+
+    # Scale data to 0-255 uint8 if needed
+    if arr.dtype != np.uint8:
+        finite_mask = np.isfinite(arr)
+        if not finite_mask.any():
+            arr = np.zeros_like(arr, dtype=np.uint8)
+        else:
+            data_min = float(np.nanmin(arr[finite_mask]))
+            data_max = float(np.nanmax(arr[finite_mask]))
+            if data_max == data_min:
+                arr = np.zeros_like(arr, dtype=np.uint8)
+            else:
+                scale = 255.0 / (data_max - data_min)
+                arr = ((arr - data_min) * scale).clip(0, 255).astype(np.uint8)
+
+    if arr.shape[2] == 1:
+        arr = arr[:, :, 0]
+    return Image.fromarray(arr)
+
+
 # ----------------------------------------------------------------------
 # Helper: annotation
 # ----------------------------------------------------------------------
@@ -430,7 +470,15 @@ def _annotate_geotiff(
     messages
 ):
     # Open image and force RGB for safe drawing
-    base_img = Image.open(tif_path)
+    try:
+        base_img = Image.open(tif_path)
+        base_img.load()
+    except Exception as ex:
+        messages.addWarningMessage(
+            f"Pillow could not open raster '{tif_path}' ({ex}); using ArcPy fallback."
+        )
+        base_img = _open_raster_as_image(tif_path, messages)
+
     if base_img.mode not in ("RGB", "RGBA"):
         base_img = base_img.convert("RGB")
 
